@@ -1,27 +1,20 @@
-// Habit Arena live-data proxy.
-// Goal: serve the last good Sheet snapshot instantly from Vercel's CDN,
-// while refreshing Google Apps Script in the background.
+// Habit Arena — reliable Google Sheet proxy
+// No artificial timeout: Google Apps Script is allowed to finish properly.
 
 let memoryPayload = null;
 let memorySavedAt = 0;
 
-function setLiveCacheHeaders(res) {
-  // The browser may reuse a very recent response for a few seconds.
+function setCacheHeaders(res) {
+  // Browser: very short cache
   res.setHeader(
     'Cache-Control',
-    'public, max-age=10, stale-while-revalidate=60'
+    'public, max-age=5, s-maxage=30, stale-while-revalidate=86400'
   );
 
-  // Keep the last good snapshot available at Vercel's edge.
-  // After 30 seconds it can be served instantly while Vercel refreshes it.
-  res.setHeader(
-    'CDN-Cache-Control',
-    'public, max-age=30, stale-while-revalidate=86400, stale-if-error=86400'
-  );
-
+  // Vercel CDN: keep the last successful scoreboard available
   res.setHeader(
     'Vercel-CDN-Cache-Control',
-    'public, max-age=30, stale-while-revalidate=86400, stale-if-error=86400'
+    'public, s-maxage=30, stale-while-revalidate=86400'
   );
 }
 
@@ -43,13 +36,13 @@ export default async function handler(req, res) {
     });
   }
 
-  // If this Vercel function instance already has fresh data,
-  // return it immediately instead of calling Google again.
+  // If this Vercel instance already has recent data,
+  // return it instantly.
   if (
     memoryPayload &&
-    Date.now() - memorySavedAt < 20_000
+    Date.now() - memorySavedAt < 30000
   ) {
-    setLiveCacheHeaders(res);
+    setCacheHeaders(res);
 
     res.setHeader(
       'X-Habit-Arena-Source',
@@ -68,50 +61,41 @@ export default async function handler(req, res) {
       url.protocol !== 'https:' ||
       url.hostname !== 'script.google.com'
     ) {
-      throw new Error('Invalid upstream');
+      throw new Error('Invalid Google Apps Script URL');
     }
 
-    url.searchParams.set(
-      'token',
-      token
-    );
+    url.searchParams.set('token', token);
 
-    // Give Apps Script enough time to wake up on a cold request.
-    const controller = new AbortController();
-
-    const timer = setTimeout(
-      () => controller.abort(),
-      45_000
-    );
-
-    let response;
-
-    try {
-      response = await fetch(
-        url,
-        {
-          redirect: 'follow',
-          signal: controller.signal,
-          headers: {
-            Accept: 'application/json'
-          }
-        }
-      );
-    } finally {
-      clearTimeout(timer);
-    }
+    // IMPORTANT:
+    // No AbortController.
+    // No 10-second timeout.
+    // No 45-second timeout.
+    // Let Apps Script actually finish.
+    const response = await fetch(url.toString(), {
+      method: 'GET',
+      redirect: 'follow',
+      cache: 'no-store',
+      headers: {
+        Accept: 'application/json'
+      }
+    });
 
     if (!response.ok) {
       throw new Error(
-        `Upstream unavailable (${response.status})`
+        `Google Apps Script returned ${response.status}`
       );
     }
 
-    const payload =
-      await response.json();
+    const payload = await response.json();
 
-    // Basic safety check so broken Sheet data
-    // never reaches the frontend.
+    // If Apps Script itself reports a Sheet problem,
+    // don't treat it as valid scoreboard data.
+    if (payload?.error) {
+      throw new Error(
+        `Apps Script: ${payload.error}`
+      );
+    }
+
     if (
       payload?.schemaVersion !== '1.0' ||
       !payload.challenge ||
@@ -120,14 +104,14 @@ export default async function handler(req, res) {
       !Array.isArray(payload.entries)
     ) {
       throw new Error(
-        'Invalid payload'
+        'Invalid scoreboard payload'
       );
     }
 
     memoryPayload = payload;
     memorySavedAt = Date.now();
 
-    setLiveCacheHeaders(res);
+    setCacheHeaders(res);
 
     res.setHeader(
       'X-Habit-Arena-Source',
@@ -140,10 +124,10 @@ export default async function handler(req, res) {
 
   } catch (error) {
 
-    // If this Vercel instance already has an older successful
-    // response, use it instead of showing an error.
+    // If this function instance already has a successful
+    // scoreboard snapshot, show that instead of failing.
     if (memoryPayload) {
-      setLiveCacheHeaders(res);
+      setCacheHeaders(res);
 
       res.setHeader(
         'X-Habit-Arena-Source',
@@ -155,13 +139,19 @@ export default async function handler(req, res) {
         .json(memoryPayload);
     }
 
+    console.error(
+      'Habit Arena Sheet error:',
+      error
+    );
+
     res.setHeader(
       'Cache-Control',
       'no-store'
     );
 
     return res.status(502).json({
-      error: 'Sheet temporarily unavailable'
+      error: 'Sheet temporarily unavailable',
+      reason: error?.message || 'Unknown error'
     });
   }
 }
