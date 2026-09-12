@@ -1,95 +1,70 @@
-export default async function handler(req, res) {
-  res.setHeader('Cache-Control', 'no-store');
+// Habit Arena Vercel proxy: keeps the Apps Script token server-side and
+// lets Vercel serve a fast recent snapshot while the upstream refreshes.
 
+export default async function handler(req, res) {
   if (req.method !== 'GET') {
-    return res.status(405).json({ error: 'Method not allowed' });
+    return res.status(405).json({
+      error: 'Method not allowed'
+    });
   }
 
-  const source = process.env.CHALLENGE_FEED_URL;
-  const token = process.env.CHALLENGE_API_TOKEN;
+  const source = process.env.CHALLENGE_FEED_URL?.trim();
+  const token = process.env.CHALLENGE_API_TOKEN?.trim();
 
   if (!source || !token) {
     return res.status(503).json({
-      error: 'Environment variables missing',
-      hasFeedUrl: !!source,
-      hasToken: !!token
+      error: 'Sheet connection not configured'
     });
   }
-
-  let url;
 
   try {
-    url = new URL(source.trim());
-  } catch {
-    return res.status(500).json({
-      error: 'CHALLENGE_FEED_URL is not a valid URL'
-    });
-  }
+    const url = new URL(source);
 
-  if (url.protocol !== 'https:' || url.hostname !== 'script.google.com') {
-    return res.status(500).json({
-      error: 'Unexpected feed URL',
-      hostname: url.hostname
-    });
-  }
+    if (
+      url.protocol !== 'https:' ||
+      url.hostname !== 'script.google.com'
+    ) {
+      throw new Error('Invalid upstream');
+    }
 
-  url.searchParams.set('token', token.trim());
+    url.searchParams.set('token', token);
 
-  let response;
-
-  try {
-    response = await fetch(url, {
+    // Avoid the AbortSignal.timeout issue we saw earlier.
+    const response = await fetch(url, {
       redirect: 'follow'
     });
-  } catch (error) {
-    return res.status(502).json({
-      error: 'Vercel could not fetch Apps Script',
-      type: error?.name || 'Unknown'
-    });
-  }
 
-  const text = await response.text();
+    if (!response.ok) {
+      throw new Error('Upstream unavailable');
+    }
 
-  if (!response.ok) {
-    return res.status(502).json({
-      error: 'Apps Script returned an HTTP error',
-      status: response.status,
-      contentType: response.headers.get('content-type')
-    });
-  }
+    const payload = await response.json();
 
-  let payload;
+    if (
+      payload?.schemaVersion !== '1.0' ||
+      !Array.isArray(payload.entries)
+    ) {
+      throw new Error('Invalid payload');
+    }
 
-  try {
-    payload = JSON.parse(text);
+    // Repeat opens can use Vercel's recent cached copy instead of
+    // waking Google Apps Script every single time.
+    //
+    // Fresh for 20 seconds.
+    // After that, Vercel may serve the old copy immediately while
+    // refreshing it in the background for up to 5 minutes.
+    res.setHeader(
+      'Cache-Control',
+      'public, s-maxage=20, stale-while-revalidate=300'
+    );
+
+    return res.status(200).json(payload);
+
   } catch {
+    res.setHeader('Cache-Control', 'no-store');
+
     return res.status(502).json({
-      error: 'Apps Script response was not JSON',
-      status: response.status,
-      contentType: response.headers.get('content-type'),
-      preview: text.slice(0, 100)
+      error: 'Sheet temporarily unavailable'
     });
   }
-
-  if (payload.error) {
-    return res.status(502).json({
-      error: 'Apps Script returned an error',
-      upstreamError: payload.error
-    });
-  }
-
-  if (payload.schemaVersion !== '1.0') {
-    return res.status(502).json({
-      error: 'Wrong schema version',
-      received: payload.schemaVersion
-    });
-  }
-
-  if (!Array.isArray(payload.entries)) {
-    return res.status(502).json({
-      error: 'Entries is not an array'
-    });
-  }
-
-  return res.status(200).json(payload);
 }
